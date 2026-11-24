@@ -130,6 +130,8 @@ class EXPORT SMCLightSensor : public IOService {
 	 *  Current lux value obtained from ACPI
 	 */
 	_Atomic(uint32_t) currentLux;
+	uint32_t lastNotifiedLux {0};
+	bool hasNotifiedLux {false};
 
 	/**
 	 *  Supported ALS bits

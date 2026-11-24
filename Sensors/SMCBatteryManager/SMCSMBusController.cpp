@@ -65,17 +65,6 @@ bool SMCSMBusController::start(IOService *provider) {
 		return false;
 	}
 	
-	if (!IOSMBusController::start(provider)) {
-		SYSLOG("smcbus", "parent start failed");
-		OSSafeReleaseNULL(workLoop);
-		OSSafeReleaseNULL(requestQueue);
-		return false;
-	}
-
-	setProperty("IOSMBusSmartBatteryManager", kOSBooleanTrue);
-	setProperty("_SBS", 1, 32);
-	registerService();
-
 	timer = IOTimerEventSource::timerEventSource(this,
 	[](OSObject *owner, IOTimerEventSource *) {
 		auto ctrl = OSDynamicCast(SMCSMBusController, owner);
@@ -86,15 +75,26 @@ bool SMCSMBusController::start(IOService *provider) {
 		}
 	});
 
-	if (timer) {
-		getWorkLoop()->addEventSource(timer);
-		timer->setTimeoutMS(TimerTimeoutMs);
-	} else {
-		SYSLOG("smcbus", "failed to allocate normal timer event");
-		OSSafeReleaseNULL(workLoop);
+	if (!timer || workLoop->addEventSource(timer) != kIOReturnSuccess) {
+		SYSLOG("smcbus", "failed to attach request completion timer");
+		OSSafeReleaseNULL(timer);
 		OSSafeReleaseNULL(requestQueue);
+		OSSafeReleaseNULL(workLoop);
 		return false;
 	}
+
+	if (!IOSMBusController::start(provider)) {
+		SYSLOG("smcbus", "parent start failed");
+		workLoop->removeEventSource(timer);
+		OSSafeReleaseNULL(timer);
+		OSSafeReleaseNULL(requestQueue);
+		OSSafeReleaseNULL(workLoop);
+		return false;
+	}
+
+	setProperty("IOSMBusSmartBatteryManager", kOSBooleanTrue);
+	setProperty("_SBS", 1, 32);
+	registerService();
 
 	BatteryManager::getShared()->start();
 	
@@ -368,6 +368,12 @@ IOSMBusStatus SMCSMBusController::startRequest(IOSMBusRequest *request) {
 		return kIOSMBusStatusUnknownFailure;
 	}
 
+	// Requests and completions run under the same workloop gate.
+	if (requestQueue->getCount() == 1 && !drainingRequests && timer->setTimeoutMS(0) != kIOReturnSuccess) {
+		requestQueue->removeObject(0);
+		return kIOSMBusStatusUnknownFailure;
+	}
+
 	IOSimpleLockLock(BatteryManager::getShared()->stateLock);
 	BatteryManager::getShared()->lastAccess = getCurrentTimeNs();
 	IOSimpleLockUnlock(BatteryManager::getShared()->stateLock);
@@ -376,7 +382,7 @@ IOSMBusStatus SMCSMBusController::startRequest(IOSMBusRequest *request) {
 }
 
 void SMCSMBusController::handleBatteryCommandsEvent() {
-	timer->setTimeoutMS(TimerTimeoutMs);
+	drainingRequests = true;
 
 	// requestQueue contains objects owned by two parties:
 	// 1. requestQueue itself, as the addition of any object retains it
@@ -391,6 +397,7 @@ void SMCSMBusController::handleBatteryCommandsEvent() {
 		if (request != nullptr)
 			completeRequest(request);
 	}
+	drainingRequests = false;
 }
 
 IOReturn SMCSMBusController::handleACPINotification(void *target) {

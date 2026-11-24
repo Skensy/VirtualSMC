@@ -15,6 +15,11 @@
 #include "kern_keys.hpp"
 #include "kern_keystore.hpp"
 
+VirtualSMCKeystore::~VirtualSMCKeystore() {
+	if (pluginLock)
+		IOLockFree(pluginLock);
+}
+
 bool VirtualSMCKeystore::init(const OSDictionary *mainprops, const OSDictionary *userprops, const SMCInfo &info, const char *board, int model, bool whbkp) {
 	deviceInfo = info;
 	deviceInfo.generatorSeed();
@@ -60,7 +65,8 @@ bool VirtualSMCKeystore::init(const OSDictionary *mainprops, const OSDictionary 
 		//TODO: do deserialization here from vsmc-data nvram variable if we need it
 	}
 
-	return true;
+	pluginLock = IOLockAlloc();
+	return pluginLock != nullptr;
 }
 
 bool VirtualSMCKeystore::mergeProvider(const OSDictionary *dict, const char *board, int model) {
@@ -161,79 +167,64 @@ IOReturn VirtualSMCKeystore::loadPlugin(VirtualSMCAPI::Plugin *plugin) {
 		return kIOReturnInvalid;
 	}
 
-	IOReturn code = kIOReturnSuccess;
-	VirtualSMCAPI::KeyStorage ovrData[2];
-	VirtualSMCAPI::KeyStorage *pData[2] {&plugin->data, &plugin->dataHidden};
-	VirtualSMCAPI::KeyStorage *sData[2] {&dataStorage, &dataHiddenStorage};
-	for (size_t i = 0; code == kIOReturnSuccess && i < arrsize(ovrData); i++) {
-		auto &currPData = *pData[i];
-		auto &currSData = *sData[i];
-		size_t j = 0;
-		while (j < currPData.size()) {
-			VirtualSMCKeyValue *tVal = nullptr;
-			if (getByName(currSData, currPData[j].key, tVal) == SmcSuccess) {
-				if (ovrData[i].push_back<2>(currPData[j])) {
-					atomic_store_explicit(&currPData[j].value, nullptr, memory_order_relaxed);
-					currPData.erase(j);
-				} else {
-					code = kIOReturnNoMemory;
-					break;
-				}
-				continue;
-			}
-			j++;
-		}
+	IOLockLock(pluginLock);
+	auto result = loadPluginLocked(plugin);
+	IOLockUnlock(pluginLock);
+	return result;
+}
+
+IOReturn VirtualSMCKeystore::loadPluginLocked(VirtualSMCAPI::Plugin *plugin) {
+	size_t slot = 0;
+	for (; slot < arrsize(pluginData); slot++) {
+		auto registered = atomic_load_explicit(&pluginData[slot], memory_order_relaxed);
+		if (registered == plugin)
+			return kIOReturnExclusiveAccess;
+		if (!registered)
+			break;
 	}
+	if (slot == arrsize(pluginData))
+		return kIOReturnNoSpace;
 
-	if (code == kIOReturnSuccess) {
-		code = kIOReturnNoSpace;
-		for (size_t i = 0; i < VirtualSMCAPI::PluginMax; i++) {
-			VirtualSMCAPI::Plugin * nullData = nullptr;
-			if (atomic_compare_exchange_strong_explicit(&pluginData[i], &nullData, plugin, memory_order_relaxed, memory_order_relaxed)) {
-				code = kIOReturnSuccess;
-				break;
-			}
-		}
+	VirtualSMCAPI::KeyStorage *incoming[] {&plugin->data, &plugin->dataHidden};
+	VirtualSMCAPI::KeyStorage *storage[] {&dataStorage, &dataHiddenStorage};
 
-		if (code == kIOReturnSuccess) {
-			for (size_t i = 0; code == kIOReturnSuccess && i < arrsize(ovrData); i++) {
-				auto &currOData = ovrData[i];
-				auto &currSData = *sData[i];
-				for (size_t j = 0; j < currOData.size(); j++) {
-					VirtualSMCKeyValue *tVal = nullptr;
-					if (getByName(currSData, currOData[j].key, tVal) == SmcSuccess) {
-						// Obtain any current value (we will check if it changed later).
-						VirtualSMCValue *orgValue = atomic_load_explicit(&tVal->value, memory_order_relaxed);
-						// Overwrite it with the new value.
-						atomic_store_explicit(&tVal->value, currOData[j].value, memory_order_relaxed);
-						// Protect the replaced value from deletion (there are no data races here).
-						atomic_store_explicit(&currOData[j].value, nullptr, memory_order_relaxed);
-						// Synchronise access by checking for any extra overrides.
-						// Note, a pointer could be lost in the first load & store pair due to a race-condition.
-						// However, this is fine, because that is a contract violation which must lead to a kernel panic.
-						VirtualSMCValue *nullValue = nullptr;
-						if (!atomic_compare_exchange_strong_explicit(&currOData[j].backup, &nullValue, orgValue,
-																	 memory_order_relaxed, memory_order_relaxed))
-							PANIC("kstore", "attempt to override twice [%08X] by %s", currOData[j].key, plugin->product);
-					} else {
-						code = kIOReturnInvalid;
-						break;
-					}
-				}
+	// Check all keys before transferring ownership. On failure the plugin can retry intact.
+	for (size_t i = 0; i < arrsize(incoming); i++) {
+		auto &keys = *incoming[i];
+		for (size_t j = 0; j < keys.size(); j++) {
+			VirtualSMCKeyValue *entry = nullptr;
+			if (j && keys[j - 1].key == keys[j].key)
+				return kIOReturnBadArgument;
+			if (getByName(*storage[i], keys[j].key, entry) == SmcSuccess && entry->backup) {
+				SYSLOG("kstore", "key [%08X] already overridden, rejecting %s", keys[j].key, plugin->product);
+				return kIOReturnExclusiveAccess;
 			}
 		}
 	}
 
-	for (auto &entry : ovrData)
-		entry.deinit();
+	for (size_t i = 0; i < arrsize(incoming); i++) {
+		auto &keys = *incoming[i];
+		for (size_t j = keys.size(); j > 0; j--) {
+			auto &key = keys[j - 1];
+			VirtualSMCKeyValue *entry = nullptr;
+			if (getByName(*storage[i], key.key, entry) == SmcSuccess) {
+				// Readers and dependent keys can still hold the original value.
+				entry->backup = atomic_load_explicit(&entry->value, memory_order_relaxed);
+				atomic_store_explicit(&entry->value, key.value, memory_order_release);
+				key.value = nullptr;
+				keys.erase(j - 1);
+			}
+		}
+	}
 
-	return code;
+	atomic_store_explicit(&pluginData[slot], plugin, memory_order_release);
+	return kIOReturnSuccess;
 }
 
 uint32_t VirtualSMCKeystore::getPublicKeyAmount() {
 	auto sz = dataStorage.size();
 	for (size_t i = 0; i < VirtualSMCAPI::PluginMax; i++) {
-		auto p = atomic_load_explicit(&pluginData[i], memory_order_relaxed);
+		auto p = atomic_load_explicit(&pluginData[i], memory_order_acquire);
 		if (!p) break;
 		sz += p->data.size();
 	}
@@ -657,7 +648,7 @@ SMC_RESULT VirtualSMCKeystore::getByName(SMC_KEY name, VirtualSMCKeyValue *&val,
 
 	if (r != SmcSuccess) {
 		for (size_t i = 0; i < VirtualSMCAPI::PluginMax; i++) {
-			auto p = atomic_load_explicit(&pluginData[i], memory_order_relaxed);
+			auto p = atomic_load_explicit(&pluginData[i], memory_order_acquire);
 			if (!p) break;
 			r = getByName(hidden ? p->dataHidden : p->data, name, val);
 			if (r == SmcSuccess)
@@ -703,7 +694,7 @@ SMC_RESULT VirtualSMCKeystore::getByIndex(SMC_KEY_INDEX idx, VirtualSMCKeyValue 
 
 	auto nidx = idx - dataStorage.size();
 	for (size_t i = 0; i < VirtualSMCAPI::PluginMax; i++) {
-		auto p = atomic_load_explicit(&pluginData[i], memory_order_relaxed);
+		auto p = atomic_load_explicit(&pluginData[i], memory_order_acquire);
 		if (!p) break;
 		if (nidx < p->data.size()) {
 			val = &p->data[nidx];
@@ -741,7 +732,7 @@ SMC_RESULT VirtualSMCKeystore::readValueByName(SMC_KEY key, const VirtualSMCValu
 
 	if (res == SmcSuccess) {
 		// Any valid value for the time being.
-		auto currval = atomic_load_explicit(&kv->value, memory_order_relaxed);
+		auto currval = atomic_load_explicit(&kv->value, memory_order_acquire);
 
 		// Check if readable
 		if (!(currval->attr & SMC_KEY_ATTRIBUTE_READ))
@@ -784,7 +775,7 @@ SMC_RESULT VirtualSMCKeystore::writeValueByName(SMC_KEY key, const SMC_DATA *dat
 	
 	if (res == SmcSuccess) {
 		// Any valid value for the time being.
-		auto currval = atomic_load_explicit(&kv->value, memory_order_relaxed);
+		auto currval = atomic_load_explicit(&kv->value, memory_order_acquire);
 
 		// Check if writable
 		if (!(currval->attr & SMC_KEY_ATTRIBUTE_WRITE))
@@ -818,7 +809,7 @@ SMC_RESULT VirtualSMCKeystore::getInfoByName(SMC_KEY key, SMC_DATA_SIZE &size, S
 	
 	if (res == SmcSuccess) {
 		// Any valid value for the time being.
-		auto currval = atomic_load_explicit(&kv->value, memory_order_relaxed);;
+		auto currval = atomic_load_explicit(&kv->value, memory_order_acquire);;
 		size = currval->size;
 		type = currval->type;
 		attr = currval->attr & ~SMC_KEY_ATTRIBUTE_CONST;

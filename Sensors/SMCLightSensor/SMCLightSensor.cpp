@@ -166,7 +166,10 @@ bool SMCLightSensor::refreshSensor(bool post) {
 	atomic_store_explicit(&currentLux, lux, memory_order_release);
 
 	if (post) {
-		VirtualSMCAPI::postInterrupt(SmcEventALSChange);
+		if ((!hasNotifiedLux || lux != lastNotifiedLux) && VirtualSMCAPI::postInterrupt(SmcEventALSChange)) {
+			lastNotifiedLux = lux;
+			hasNotifiedLux = true;
+		}
 		poller->setTimeoutMS(SensorUpdateTimeoutMS);
 	}
 

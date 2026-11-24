@@ -730,8 +730,12 @@ IOReturn VirtualSMC::callPlatformFunction(const OSSymbol *functionName, bool, vo
 	if (functionName && param1 && param2 && functionName->isEqualTo(VirtualSMCAPI::SubmitPlugin)) {
 		DBGLOG("vsmc", "received plugin submission");
 		// Retain a plugin just in case the implementation allows unloading...
-		static_cast<IOService *>(param1)->retain();
-		return keystore->loadPlugin(static_cast<VirtualSMCAPI::Plugin *>(param2));
+		auto service = static_cast<IOService *>(param1);
+		service->retain();
+		auto result = keystore->loadPlugin(static_cast<VirtualSMCAPI::Plugin *>(param2));
+		if (result != kIOReturnSuccess)
+			service->release();
+		return result;
 	}
 
 	return kIOReturnUnsupported;

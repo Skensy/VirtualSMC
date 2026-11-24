@@ -40,13 +40,6 @@ class EXPORT SMCSMBusController : public IOSMBusController {
 	static void setReceiveData(IOSMBusTransaction *transaction, uint16_t valueToWrite);
 
 	/**
-	 *  Sensible defaults for timer probing and rechecking the new commands.
-	 *  Note: when it was 1000, after extending the code it failed to read all data in 10 seconds,
-	 *  so AppleSmartBatteryManager aborted polling.
-	 */
-	static constexpr uint32_t TimerTimeoutMs = 100;
-
-	/**
 	 *  A workloop in charge of handling timer events with requests.
 	 */
 	IOWorkLoop *workLoop {nullptr};
@@ -60,6 +53,7 @@ class EXPORT SMCSMBusController : public IOSMBusController {
 	 *  Registered SMBus requests.
 	 */
 	OSArray *requestQueue {nullptr};
+	bool drainingRequests {false};
 
 	/**
 	 *  Create battery date in AppleSmartBattery format

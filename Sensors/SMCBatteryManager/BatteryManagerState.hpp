@@ -17,6 +17,14 @@ struct BatteryInfo {
 	 */
 	static constexpr uint32_t ValueUnknown = 0xFFFFFFFF;
 
+	// Convert mWh to mAh or mW to mA without converting the ACPI unknown sentinel.
+	static uint32_t toChargeUnits(uint32_t value, uint32_t millivolts) {
+		if (value == ValueUnknown || !millivolts || millivolts == ValueUnknown)
+			return ValueUnknown;
+		auto converted = static_cast<uint64_t>(value) * 1000 / millivolts;
+		return converted < ValueUnknown ? static_cast<uint32_t>(converted) : ValueUnknown;
+	}
+
 	/**
 	 *  Maximum integer value (according to ACPI)
 	 */

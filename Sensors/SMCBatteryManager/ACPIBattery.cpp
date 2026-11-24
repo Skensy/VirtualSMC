@@ -165,7 +165,8 @@ bool ACPIBattery::getBatteryInfo(BatteryInfo &bi, bool extended) {
 
 	if (!extended) {
 		// Assume battery designed for 1000 cycles
-		if (bi.designCapacity && bi.state.lastFullChargeCapacity)
+		if (bi.designCapacity && bi.designCapacity != BatteryInfo::ValueUnknown &&
+			bi.state.lastFullChargeCapacity && bi.state.lastFullChargeCapacity != BatteryInfo::ValueUnknown)
 			bi.cycle = (bi.designCapacity - bi.state.lastFullChargeCapacity) * 1000 / bi.designCapacity;
 		else
 			bi.cycle = 0;
@@ -177,11 +178,6 @@ bool ACPIBattery::getBatteryInfo(BatteryInfo &bi, bool extended) {
 bool ACPIBattery::updateRealTimeStatus(bool quickPoll) {
 	OSObject *acpi = nullptr;
 	if (device->evaluateObject(AcpiBatteryStatus, &acpi) != kIOReturnSuccess) {
-		//CHECKME: unsure why this should be done here, this may be a mistake
-		// of the original implementation, in which case no code is to be run.
-		IOSimpleLockLock(batteryInfoLock);
-		batteryInfo->state.lastRemainingCapacity = batteryInfo->state.remainingCapacity;
-		IOSimpleLockUnlock(batteryInfoLock);
 		return false;
 	}
 
@@ -189,9 +185,6 @@ bool ACPIBattery::updateRealTimeStatus(bool quickPoll) {
 	if (!status) {
 		IOSimpleLockLock(batteryInfoLock);
 		batteryInfo->connected = false;
-		//CHECKME: unsure why this should be done here, this may be a mistake
-		// of the original implementation, in which case no code is to be run.
-		batteryInfo->state.lastRemainingCapacity = batteryInfo->state.remainingCapacity;
 		IOSimpleLockUnlock(batteryInfoLock);
 		SYSLOG("acpib", "error in ACPI data");
 		acpi->release();
@@ -286,25 +279,29 @@ bool ACPIBattery::updateRealTimeStatus(bool quickPoll) {
 	}
 
 	st.state = getNumberFromArray(status, BSTState);
-	st.presentRate = getNumberFromArray(status, BSTPresentRate);
-	st.remainingCapacity = getNumberFromArray(status, BSTRemainingCapacity);
+	auto rate = getNumberFromArray(status, BSTPresentRate);
+	auto capacity = getNumberFromArray(status, BSTRemainingCapacity);
 	st.presentVoltage = getNumberFromArray(status, BSTPresentVoltage);
 	if (st.powerUnitIsWatt) {
-		st.presentRate = st.presentRate * 1000 / st.designVoltage;
-		st.remainingCapacity = st.remainingCapacity * 1000 / st.designVoltage;
+		rate = BatteryInfo::toChargeUnits(rate, st.designVoltage);
+		capacity = BatteryInfo::toChargeUnits(capacity, st.designVoltage);
 	}
+	st.presentRate = rate == BatteryInfo::ValueUnknown ? 0 : rate;
+	st.remainingCapacity = capacity == BatteryInfo::ValueUnknown ? st.lastRemainingCapacity : capacity;
 
 	// Sometimes this value can be either reported incorrectly or miscalculated
 	// and exceed the actual capacity. Simply workaround it by capping the value.
 	// REF: https://github.com/acidanthera/bugtracker/issues/565
-	if (st.remainingCapacity > st.lastFullChargeCapacity)
+	if (st.lastFullChargeCapacity && st.remainingCapacity > st.lastFullChargeCapacity)
 		st.remainingCapacity = st.lastFullChargeCapacity;
 
 	// Average rate calculation
 	if (supplementConfig & (1U << BSSAverageRate)) {
 		st.averageRate = st.signedAverageRateHW < 0 ? -st.signedAverageRateHW : st.signedAverageRateHW;
+		if (rate == BatteryInfo::ValueUnknown)
+			st.presentRate = st.averageRate;
 	} else {
-		if (!st.presentRate || (st.presentRate == BatteryInfo::ValueUnknown)) {
+		if (!st.presentRate && st.lastRemainingCapacity && capacity != BatteryInfo::ValueUnknown) {
 			auto delta = (st.remainingCapacity > st.lastRemainingCapacity ?
 						  st.remainingCapacity - st.lastRemainingCapacity :
 						  st.lastRemainingCapacity - st.remainingCapacity);
@@ -327,6 +324,10 @@ bool ACPIBattery::updateRealTimeStatus(bool quickPoll) {
 			st.averageRate = lowAverageBound;
 	}
 
+	// Keep real samples as the baseline, before applying the SMBus boot fallback.
+	if (capacity != BatteryInfo::ValueUnknown)
+		st.lastRemainingCapacity = st.remainingCapacity;
+
 	// Remaining capacity
 	if (!st.remainingCapacity || st.remainingCapacity == BatteryInfo::ValueUnknown) {
 		SYSLOG("acpib", "battery %d has no remaining capacity reported (%u)", id, st.remainingCapacity);
@@ -338,6 +339,11 @@ bool ACPIBattery::updateRealTimeStatus(bool quickPoll) {
 		else
 			st.averageTimeToEmpty = st.averageRate ? 60 * st.remainingCapacity / st.averageRate : 60 * st.remainingCapacity;
 		st.runTimeToEmpty = st.presentRate ? 60 * st.remainingCapacity / st.presentRate : 60 * st.remainingCapacity;
+		if (rate == BatteryInfo::ValueUnknown && !st.presentRate) {
+			st.runTimeToEmpty = UINT16_MAX;
+			if (!st.averageRate && !(supplementConfig & (1U << BSSTimeToEmpty)))
+				st.averageTimeToEmpty = UINT16_MAX;
+		}
 	}
 
 	// Voltage
@@ -383,6 +389,9 @@ bool ACPIBattery::updateRealTimeStatus(bool quickPoll) {
 			st.batteryIsFull = false;
 			if (supplementConfig & (1U << BSSTimeToFull)) {
 				st.timeToFull = st.timeToFullHW;
+			} else if (st.lastFullChargeCapacity == BatteryInfo::ValueUnknown ||
+					   (!st.averageRate && rate == BatteryInfo::ValueUnknown)) {
+				st.timeToFull = UINT16_MAX;
 			} else {
 				int diff = st.remainingCapacity < st.lastFullChargeCapacity ? st.lastFullChargeCapacity - st.remainingCapacity : 0;
 				st.timeToFull = 60 * diff;
@@ -400,8 +409,6 @@ bool ACPIBattery::updateRealTimeStatus(bool quickPoll) {
 			break;
 		}
 	}
-
-	st.lastRemainingCapacity = st.remainingCapacity;
 
 	// bool warning  = st.remainingCapacity <= st.designCapacityWarning || st.runTimeToEmpty < 10;
 	bool critical = st.remainingCapacity <= st.designCapacityLow || st.runTimeToEmpty < 5;
@@ -462,6 +469,8 @@ bool ACPIBattery::updateStaticStatus(bool *calculatedACAdapterConnection) {
 				*calculatedACAdapterConnection = bi.state.calculatedACAdapterConnected;
 
 			IOSimpleLockLock(batteryInfoLock);
+			if (bi.connected && batteryInfo->connected)
+				bi.state.lastRemainingCapacity = batteryInfo->state.lastRemainingCapacity;
 			*batteryInfo = bi;
 			IOSimpleLockUnlock(batteryInfoLock);
 

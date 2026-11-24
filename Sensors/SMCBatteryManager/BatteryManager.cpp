@@ -13,21 +13,27 @@ BatteryManager *BatteryManager::instance = nullptr;
 OSDefineMetaClassAndStructors(BatteryManager, OSObject)
 
 void BatteryInfo::validateData(int32_t id) {
-	if (!state.designVoltage)
+	if (!state.designVoltage || state.designVoltage == ValueUnknown)
 		state.designVoltage = DummyVoltage;
 	if (state.powerUnitIsWatt) {
 		auto mV = state.designVoltage;
 		DBGLOG("binfo", "battery %d design voltage %d,%03d", id, mV / 1000, mV % 1000);
-		if (designCapacity * 1000 / mV < 900) {
+		auto convertedDesign = toChargeUnits(designCapacity, mV);
+		if (convertedDesign < 900) {
 			SYSLOG("binfo", "battery %d reports mWh but uses mAh (%u)", id, designCapacity);
 			state.powerUnitIsWatt = false;
 		} else {
-			designCapacity = designCapacity * 1000 / mV;
-			state.lastFullChargeCapacity = state.lastFullChargeCapacity * 1000 / mV;
-			state.designCapacityWarning = state.designCapacityWarning * 1000 / mV;
-			state.designCapacityLow = state.designCapacityLow * 1000 / mV;
+			designCapacity = convertedDesign;
+			state.lastFullChargeCapacity = toChargeUnits(state.lastFullChargeCapacity, mV);
+			state.designCapacityWarning = toChargeUnits(state.designCapacityWarning, mV);
+			state.designCapacityLow = toChargeUnits(state.designCapacityLow, mV);
 		}
 	}
+
+	if (state.designCapacityLow == ValueUnknown)
+		state.designCapacityLow = 0;
+	if (state.designCapacityWarning == ValueUnknown)
+		state.designCapacityWarning = 0;
 
 	if (designCapacity < state.lastFullChargeCapacity) {
 		SYSLOG("binfo", "battery %d reports lower design capacity than maximum charged (%u/%u)", id,
@@ -246,6 +252,7 @@ bool BatteryManager::probe() {
 		auto dict = IOService::nameMatching("AppleACPIPlatformExpert");
 		if (!dict) {
 			SYSLOG("bmgr", "failed to create acpi matching dictionary");
+			IOLockUnlock(mainLock);
 			return false;
 		}
 		
@@ -260,6 +267,7 @@ bool BatteryManager::probe() {
 
 		if (!acpi) {
 			SYSLOG("bmgr", "failed to wait for acpi");
+			IOLockUnlock(mainLock);
 			return false;
 		}
 

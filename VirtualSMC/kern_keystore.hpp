@@ -17,6 +17,7 @@
 #include <VirtualSMCSDK/kern_keyvalue.hpp>
 
 #include <IOKit/IORegistryEntry.h>
+#include <IOKit/IOLocks.h>
 #include <libkern/c++/OSArray.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSDictionary.h>
@@ -104,6 +105,9 @@ class VirtualSMCKeystore {
 	 *  Registered plugin key arrays in the keystore
 	 */
 	_Atomic(VirtualSMCAPI::Plugin *) pluginData[VirtualSMCAPI::PluginMax] {};
+
+	IOLock *pluginLock {nullptr};
+	IOReturn loadPluginLocked(VirtualSMCAPI::Plugin *plugin);
 
 	/**
 	 *  Quick access pointers to access keys necessary used for r/w privilege management
@@ -218,6 +222,8 @@ class VirtualSMCKeystore {
 	 */
 	uint8_t *serialize(size_t &size) const;
 public:
+	~VirtualSMCKeystore();
+
 
 	/**
 	 *  Merges keys into keystore from a provider OSDictionary
